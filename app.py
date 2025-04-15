@@ -1,175 +1,186 @@
-import threading
-import time
+from flask import Flask, render_template, jsonify, Response
 import cv2
-from kivy.app import App
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
-from kivy.uix.label import Label
-from kivy.uix.image import Image
-from kivy.graphics.texture import Texture
-from kivy.core.audio import SoundLoader
-import pyttsx3  # for text-to-speech
-from object_detection import detect_objects  # This function uses YOLOv5
-from voice_command import listen_for_command  # This will handle voice commands
-from haptic_feedback import trigger_haptic_feedback  # Handle feedback when obstacles are close
+import torch
+from gtts import gTTS
+import os
+import platform
+import threading
 
-# Initialize the navigation state
-navigation_running = False
+app = Flask(__name__)
 
+# Global variables
+camera_running = False
+cap = None
+show_camera = False
 
-# Simple distance estimation for object proximity (using a hypothetical conversion factor to meters)
-def estimate_distance(center_x, center_y, frame_width, frame_height, conversion_factor=0.05):
-    distance_pixels = ((frame_width / 2 - center_x) ** 2 + (frame_height / 2 - center_y) ** 2) ** 0.5
-    distance_meters = distance_pixels * conversion_factor
-    return distance_meters
+# Load YOLOv5 model
+model = torch.hub.load('ultralytics/yolov5', 'yolov5s')
 
+# Function to generate a beep sound
+def beep():
+    system_platform = platform.system()
+    if system_platform == "Windows":
+        import winsound
+        winsound.Beep(1000, 500)  # Frequency: 1000Hz, Duration: 500ms
+    else:
+        os.system('echo -e "\a"')  # Linux/Mac
 
-class NavigationApp(BoxLayout):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.orientation = 'vertical'
+# Function to speak object names (cross-platform)
+def speak(text):
+    try:
+        if os.path.exists("object.mp3"):
+            os.remove("object.mp3")
 
-        # Create the top section with the status label
-        self.status_label = Label(text="Ready to start navigation.", size_hint=(1, 0.1))
-        self.add_widget(self.status_label)
+        tts = gTTS(text=text, lang='en')
+        tts.save("object.mp3")
 
-        # Create video feed section
-        self.image_widget = Image(size_hint=(1, 0.7))
-        self.add_widget(self.image_widget)
+        if platform.system() == "Windows":
+            from playsound import playsound
+            playsound("object.mp3")
+        else:
+            os.system("mpg321 object.mp3")
 
-        # Create the bottom section with control buttons
-        control_layout = BoxLayout(size_hint=(1, 0.2), orientation='horizontal')
+        if os.path.exists("object.mp3"):
+            os.remove("object.mp3")
+    except Exception as e:
+        print(f"Error in speak(): {str(e)}")
 
-        # Add Start and Stop buttons (for manual control)
-        self.start_button = Button(text="Start Navigation", on_press=self.start_navigation)
-        self.stop_button = Button(text="Stop Navigation", on_press=self.stop_navigation)
-        control_layout.add_widget(self.start_button)
-        control_layout.add_widget(self.stop_button)
+# Function to identify all objects in the defined path
+def identify_object_in_path(frame):
+    try:
+        # Define the path (middle 20% width and 80% height of the frame)
+        height, width, _ = frame.shape
+        path_x1 = int(width * 0.4)  # 20% from left
+        path_x2 = int(width * 0.6)  # 20% from right
+        path_y1 = int(height * 0.1)  # 10% from top
+        path_y2 = int(height * 0.9)  # 10% from bottom
 
-        self.add_widget(control_layout)
+        # Draw the path on the frame
+        cv2.rectangle(frame, (path_x1, path_y1), (path_x2, path_y2), (0, 255, 0), 2)
 
-        # Initialize frame buffer
-        self.frame_buffer = None
-        self.buffer_lock = threading.Lock()
+        # Crop the frame to the path region
+        path_frame = frame[path_y1:path_y2, path_x1:path_x2]
 
-        # Initialize text-to-speech engine
-        self.tts_engine = pyttsx3.init()
+        # Perform object detection on the path region
+        results = model(path_frame)
+        detections = results.xyxy[0].numpy()
 
-        # Set up speech rate, volume, and voice
-        self.tts_engine.setProperty('rate', 150)  # Speed of speech
-        self.tts_engine.setProperty('volume', 1)  # Volume level (0.0 to 1.0)
+        detected_objects = []
 
-        # Start video capture thread
-        self.capture_thread = threading.Thread(target=self.capture_video, daemon=True)
-        self.capture_thread.start()
+        for detection in detections:
+            x1, y1, x2, y2, conf, cls = detection
+            if conf > 0.5:  # Confidence threshold
+                label = model.names[int(cls)]
+                detected_objects.append(label)
+                print(f"Detected: {label} (Confidence: {conf:.2f})")
 
-        # Start voice command listener in a separate thread
-        self.voice_thread = threading.Thread(target=self.listen_for_voice_commands, daemon=True)
-        self.voice_thread.start()
+        return detected_objects
+    except Exception as e:
+        print(f"Error in identify_object_in_path(): {str(e)}")
+        return None
 
-    def start_navigation(self, instance):
-        if self.status_label:
-            self.status_label.text = "Navigation Started"
-        global navigation_running
-        navigation_running = True
-        threading.Thread(target=self.run_navigation, daemon=True).start()
+# Function to run navigation system
+def run_navigation():
+    global camera_running, cap, show_camera
+    cap = cv2.VideoCapture(0)
+    while camera_running:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    def stop_navigation(self, instance):
-        if self.status_label:
-            self.status_label.text = "Navigation Stopped"
-        global navigation_running
-        navigation_running = False
+        # Identify objects in the path
+        detected_objects = identify_object_in_path(frame)
 
-    def capture_video(self):
-        cap = cv2.VideoCapture(0)  # Open the camera
-        if not cap.isOpened():
-            self.provide_feedback("Camera not accessible!")
-            return
+        # Trigger beep and speak if objects are detected
+        if detected_objects:
+            beep()
+            speak(f"There is a {', '.join(detected_objects)} in front of you.")
 
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                with self.buffer_lock:
-                    self.frame_buffer = frame
+        # Show the camera feed if enabled
+        if show_camera:
+            cv2.imshow("Camera Feed", frame)
+            cv2.waitKey(1)
 
-    def run_navigation(self):
-        while navigation_running:
-            if self.frame_buffer is None:
-                time.sleep(0.05)
-                continue
+    if cap:
+        cap.release()
+    cv2.destroyAllWindows()
+    print("Navigation stopped.")
 
-            # Get the latest frame from the buffer
-            with self.buffer_lock:
-                frame = self.frame_buffer.copy()
+# Route for the home page
+@app.route('/')
+def home():
+    return render_template('index.html')
 
-            # Resize frame for efficient processing
-            frame_resized = cv2.resize(frame, (416, 416))  # Use smaller input size for YOLOv5
+# Route to start the navigation
+@app.route('/start')
+def start():
+    global camera_running
+    if not camera_running:
+        camera_running = True
+        threading.Thread(target=run_navigation).start()
+        return "Navigation started!"
+    return "Navigation is already running!"
 
-            # Detect objects using YOLOv5 (COCO dataset)
-            objects = detect_objects(frame_resized)
+# Route to stop the navigation
+@app.route('/stop')
+def stop():
+    global camera_running
+    if camera_running:
+        camera_running = False
+        return "Navigation stopped!"
+    return "Navigation is not running!"
 
-            # Process objects and give feedback for each detected object
-            detected_objects = []
-            for obj_name, conf, center_x, center_y in objects:
-                if conf > 0.5:  # Confidence threshold
-                    detected_objects.append(obj_name)
-                    distance = estimate_distance(center_x, center_y, frame.shape[1], frame.shape[0])
+# Route to toggle camera view
+@app.route('/toggle_camera')
+def toggle_camera():
+    global show_camera
+    show_camera = not show_camera
+    return f"Camera view {'enabled' if show_camera else 'disabled'}."
 
-                    if distance < 1.0:  # Trigger feedback for close objects
-                        self.provide_feedback(f"Warning! {obj_name} is very close, less than 1 meter.")
-                        trigger_haptic_feedback()
+# Route to identify the object in front
+@app.route('/identify_object')
+def identify_object():
+    global cap
+    if cap is None or not cap.isOpened():
+        return jsonify({"error": "Camera is not running."})
 
-            # Update status label
-            if detected_objects:
-                self.status_label.text = f"Objects detected: {', '.join(set(detected_objects))}."
-            else:
-                self.status_label.text = "No objects detected."
+    ret, frame = cap.read()
+    if not ret:
+        return jsonify({"error": "Failed to capture frame."})
 
-            # Display video feed
-            self.display_video(frame)
+    detected_objects = identify_object_in_path(frame)
+    if detected_objects:
+        speak(f"There is a {', '.join(detected_objects)} in front of you.")
+        return jsonify({"objects": detected_objects})
+    else:
+        speak("I don't see any object.")
+        return jsonify({"objects": None})
 
-            time.sleep(0.05)  # Add a delay to reduce CPU/GPU usage
+# Route to stream camera feed
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-    def display_video(self, frame):
-        # Convert the frame from BGR to RGB
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Convert the frame to texture and update the image widget
-        texture = Texture.create(size=(frame.shape[1], frame.shape[0]), colorfmt='rgb')
-        texture.blit_buffer(frame_rgb.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
-        self.image_widget.texture = texture
+def generate_frames():
+    global cap, show_camera
+    while show_camera:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    def provide_feedback(self, text):
-        # Text-to-Speech feedback
-        def speak_text():
-            try:
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-            except Exception as e:
-                print(f"Error during TTS: {e}")
+        # Draw the path on the frame
+        height, width, _ = frame.shape
+        path_x1 = int(width * 0.4)
+        path_x2 = int(width * 0.6)
+        path_y1 = int(height * 0.1)
+        path_y2 = int(height * 0.9)
+        cv2.rectangle(frame, (path_x1, path_y1), (path_x2, path_y2), (0, 255, 0), 2)
 
-        # Run TTS in a separate thread to avoid blocking
-        threading.Thread(target=speak_text, daemon=True).start()
+        # Encode the frame as JPEG
+        ret, buffer = cv2.imencode('.jpg', frame)
+        frame = buffer.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-        # Optional: Play sound as additional feedback
-        sound = SoundLoader.load('alert_sound.wav')  # Load sound for feedback
-        if sound:
-            sound.play()
-
-    def listen_for_voice_commands(self):
-        # Continuously listen for voice commands in a separate thread
-        while True:
-            command = listen_for_command()  # Call the function to listen for voice commands
-            print(f"Voice command: {command}")  # Debug: Print the command to check if it's detected
-            if command:
-                if 'detect' in command.lower() and navigation_running:
-                    self.provide_feedback("Detecting obstacles...")
-
-
-class MainApp(App):
-    def build(self):
-        return NavigationApp()
-
-
-if __name__ == "__main__":
-    MainApp().run()
+if __name__ == '__main__':
+    app.run(debug=True)
