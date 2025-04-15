@@ -1,0 +1,27 @@
+<NavigationApp>:
+    orientation: 'vertical'
+
+    Label:
+        id: status_label
+        text: "Waiting for command..."
+        font_size: 24
+        size_hint_y: None
+        height: '48dp'
+
+    BoxLayout:
+        orientation: 'horizontal'
+        Button:
+            text: "Start Navigation"
+            size_hint_y: None
+            height: '48dp'
+            on_press: app.start_navigation()
+
+        Button:
+            text: "Stop Navigation"
+            size_hint_y: None
+            height: '48dp'
+            on_press: app.stop_navigation()
+
+    Image:
+        id: video_feed
+        size_hint: 1, 1
